@@ -1,0 +1,440 @@
+# Author: Christopher D. Eager, 2014, eager2@illinois.edu
+######################################################################################################################################################################
+# REQUIREMENTS FOR SCRIPT TO WORK PROPERLY
+# 1. TextGrids and corresponding Wavs must have the same name
+# 2. All TextGrids and Wavs must be in the same folder
+# 3. TextGrids should have the following organization
+#	Tier 1: Words (pauses/silences must be marked as "sil", "CPRCsp", or "CPsil")
+#	Tier 2: Phones
+#	Tier 3: Syllables (stressed syllables marked "T" and unstressed syllables left empty)
+#	Tier 4: ToBI Transcription (MUST BE A POINT TIER: any label containing "-", "%", "R", or "s" will be sorted as a boundary; otherwise accent)
+# 4. Boundaries in the textgrids must be aligned exactly; for instance, if the first phone in a syllable has a boundary that starts slightly (even 0.00000005 seconds) 
+#    after the syllable boundary due to manual alignment by dragging boundaries, it can throw all of the calculations off.  Word-phone and word-syllable alignment do 
+#    not always coincide in cases of gemination and resyllabification, but if they are supposed to coincide, the same rule applies.  As for ToBI alignment, 
+#    the rule is any accent that is after the word's beginning boundary (but not on that boundary) and before or on the ending boundary is included with that word.
+# 5. When you run the script, you will have to specify a directory where the textgrids and wavs are; this is the same folder to which the data tables will be written
+#    and it needs to end with "\"
+######################################################################################################################################################################
+# After the script is finished running, two csv files will be saved into the directory containing the wavs and textgrids:
+# 1. "Prosody_Project_Acoustic_Data.csv" has the measurements take for each word
+# 2. "Prosody_Project_Speechrate_Data.csv" has the phone rates and syllable rates computed for each window which can be used to z-score speech rate measures
+#     in the other data table as well as for creating speechrate curves
+######################################################################################################################################################################
+
+#Procedures are defined after main body of code
+
+form Prosody Project Acoustic Analysis
+	sentence dirname C:\Users\Admin\Desktop\Prosody\Spanish\Data\WAVs and TextGrids\
+endform
+
+# Create Data Table.  The integer n controls what row is being written to
+Create Table with column names... Prosody_Project_Acoustic_Data 0 token word tobiaccent tobiboundary filename wordmin wordmax stressmin stressmax svmin svmax sv phonwordmin phonwordmax phonword durword durstress dursv durphonword wordphonerate wordsyllrate stressphonerate stresssyllrate phonwordphonerate phonwordsyllrate intsv f0wordmax f0wordmin f0wordrange f0stressmax f0stressmin f0stressrange f0svmax f0svmin f0svrange
+n = 1
+
+# Create table for speech rate curves.  The integer m controls what row is being written to
+Create Table with column names... Prosody_Project_Speechrate_Curve 0 token filename wl wr words phonerate syllrate wmid
+m = 1
+
+# Create file list
+Create Strings as file list... fileList 'dirname$'*.TextGrid
+
+# this for loop iterates for each file
+number_of_files = Get number of strings
+for b from 1 to number_of_files
+	#first open the files and create tables for each textgrid tier
+	select Strings fileList
+	current_file$ = Get string... 'b'
+	name$ = current_file$ - ".TextGrid"
+	Read from file... 'dirname$''name$'.TextGrid
+	Read from file... 'dirname$''name$'.wav
+
+	#tier limits
+	select TextGrid 'name$'
+	numWords = Get number of intervals... 1
+	durfile = Get end point... 1 numWords
+
+	#create speech curve for current file
+	#define window length and timestep
+	wlength = 0.5
+	speechratetimestep = 0.01
+	wleft = 0
+	wright = wlength
+	while wright<=durfile
+		select TextGrid 'name$'
+		#the compute$ variable keeps track of whether the current window has any silences in it
+		compute = 1
+		#not sure how Praat does with empty strings (and dont want to experiment with it) so i just figured i would create an initial "n"
+		words$ = "n"
+		@getIntervals(name$,1,wleft,wright)
+		for x from first to last
+			currword$ = Get label of interval... 1 x
+			if currword$="CPsil" or currword$="CPRCsp" or currword$="sil" or index(currword$,"{")>0 or index(currword$,"<")>0 or length(currword$)=0
+				compute = 0
+			endif
+			words$ = words$ + " " + currword$
+		endfor
+		if compute = 1
+			@getSpeechRate (name$,2,wleft,wright)
+			currphonerate = rate
+			@getSpeechRate (name$,3,wleft,wright)
+			currsyllrate = rate
+			#remove initial "n " from words$
+			words$ = right$(words$,(length(words$)-2))
+			wmid = (wleft+wright)/2
+			select Table Prosody_Project_Speechrate_Curve
+			Append row
+			Set numeric value... m token m
+			Set string value... m filename 'name$'
+			Set numeric value... m wl wleft
+			Set numeric value... m wr wright
+			Set string value... m words 'words$'
+			Set numeric value... m phonerate currphonerate
+			Set numeric value... m syllrate currsyllrate
+			Set numeric value... m wmid wmid
+			m = m+1
+		endif
+		#move window boundaries forward one timestep
+		wleft = wleft+speechratetimestep
+		wright = wright+speechratetimestep
+	endwhile
+	
+	#create pitch and intensity objects for sound file
+	select Sound 'name$'
+	pitch = To Pitch (ac)... 0.001 65 15 no 0.03 0.45 0.01 0.35 0.14 300
+	select Sound 'name$'
+	allint = To Intensity... 100 0.001 yes
+
+	#set initial phonword
+	select TextGrid 'name$'
+	phonwordmin = Get start point... 1 1
+	#as we loop through the file, phonwordmax is set initially to wordmax for each word
+	#then it is set to phonwordmin whenever the word is not stressed
+	#phonwordmin is set to -1 when the word is a pause and then reset at the next iteration
+	#thus when we arrive to the computation of phonword information, "if phonwordmin=phonwordmax" will tell us if we are looking at a stressed word
+	#if we are looking at a stressed word, we compute duration, phonerate, syllrate, and words in the phonological word
+	#if it is not a stressed word, we set these all to 0 or "NA"
+	#then we set phonwordmin to equal phonwordmax after we enter data into the table
+
+	# this next for loop iterates for each interval on the word transcription tier of the text grid
+	# first, boundaries of the various segments are determined (word, stressed syllable, phonological word, stressed vowel) and their durations are calucluated
+	# then, using the boundaries, intensity, f0, phonerate, and syllrate are calculated for the segments when relevant
+	# then the words that comprise the phonological word are determined
+	# then the ToBI labels for each word are extracted
+	# finally, all of this information is entered into the data table
+	for i from 1 to numWords
+		
+		#get word, word boundaries, and word duration
+		select TextGrid 'name$'
+		wordmin = Get start point... 1 i
+		wordmax = Get end point... 1 i
+		word$ = Get label of interval... 1 i
+		durword = wordmax-wordmin
+
+		#this if statement skips pauses
+		if word$ <> "CPRCsp" and word$ <> "CPsil" and word$ <> "sil" and index(word$,"{")=0 and index(word$,"<")=0 and length(word$)>0
+			#if phonwordmin = -1 then this is the first word following a pause, and phonword needs to be reset; either way phonwordmax needs to be reset
+			if phonwordmin = -1
+				phonwordmin = wordmin
+			endif
+			phonwordmax = wordmax
+
+			#get boundaries of the stressed syllable and compute duration
+			#if there is no stressed syllable in the word, set these to the word boundaries
+			@getIntervals(name$,3,wordmin,wordmax)
+			numStressed = 0
+			stressed = 0
+			firstsyll = first
+			lastsyll = last
+			for s from firstsyll to lastsyll
+				currmin = Get start point... 3 s
+				currmax = Get end point... 3 s
+				currstress$ = Get label of interval... 3 s
+				if index(currstress$,"T")>0
+					numStressed = numStressed+1
+					if currmin>=wordmin and currmax<=wordmax
+						stressed = s
+					endif
+				endif
+			endfor
+			if numStressed=0
+				stressmin = wordmin
+				stressmax = wordmax
+				phonwordmax = phonwordmin
+			else
+				if stressed>0
+					stressmin = Get start point... 3 stressed
+					stressmax = Get end point... 3 stressed
+				else
+					#this else statement is only activated if
+					#there are no stressed syllables contained completely within the word
+					#but there are stressed syllables that overlap with either the preceding or following word
+					#if firstsyll and lastsyll are both stressed and lastsyll should be interpreted as the stressed syllable,
+					#this needs to be marked by adding an "n" after the "T" in firstsyll, as the two cases cannot be otherwise
+					#distinguished; there should be very very few cases where this is necessary
+					firststress$ = Get label of interval... 3 firstsyll
+					if index(firststress$,"T")>0 and index(firststress$,"n")=0
+						stressmin = Get start point... 3 firstsyll
+						stressmax = Get end point... 3 firstsyll
+					else
+						stressmin = Get start point... 3 lastsyll
+						stressmax = Get end point... 3 lastsyll
+					endif
+				endif
+			endif
+			#at this point it is entirely possible and likely that prepositions whose syllables overlap with surrounding content words have been marked
+			#as stressed, and so we need to have a stop list that takes care of this
+			if word$="en" or word$="de" or word$="que" or word$="que*" or word$="a" or word$="al" or word$="para" or word$="porque" or word$="ese"
+				stressmin = wordmin
+				stressmax = wordmax
+				phonwordmax = phonwordmin
+			endif
+			durstress = stressmax-stressmin
+
+			#get boundaries of the stressed vowel
+			@getIntervals(name$,2,stressmin,stressmax)
+			lastphone = last
+			svmin = Get start point... 2 first
+			svmax = Get end point... 2 first
+			dursv = svmax-svmin
+			sv$ = Get label of interval... 2 first
+			p = first+1
+			while p<=lastphone and index(sv$,"a")=0 and index(sv$,"e")=0 and index(sv$,"i")=0 and index(sv$,"o")=0 and index(sv$,"u")=0
+				svmin = Get start point... 2 p
+				svmax = Get end point... 2 p
+				sv$ = Get label of interval... 2 p
+				p = p+1
+			endwhile
+
+			#intensity measures
+			select allint
+			intsv = Get mean... svmin svmax energy
+
+			#pitch measures
+			select pitch
+			f0wordmax = Get maximum... wordmin wordmax Hertz Parabolic
+			f0wordmin = Get minimum... wordmin wordmax Hertz Parabolic
+			f0wordrange = f0wordmax-f0wordmin
+			f0stressmax = Get maximum... stressmin stressmax Hertz Parabolic
+			f0stressmin = Get minimum... stressmin stressmax Hertz Parabolic
+			f0stressrange = f0stressmax-f0stressmin
+			f0svmax = Get maximum... svmin svmax Hertz Parabolic
+			f0svmin = Get minimum... svmin svmax Hertz Parabolic
+			f0svrange = f0svmax-f0svmin
+
+			#phonerate and syllrate measures
+			@getSpeechRate (name$,2, wordmin, wordmax)
+			wordphonerate = rate
+			@getSpeechRate (name$,3, wordmin, wordmax)
+			wordsyllrate = rate
+			@getSpeechRate (name$,2, stressmin, stressmax)
+			stressphonerate = rate
+			@getSpeechRate (name$,3, stressmin, stressmax)
+			stresssyllrate = rate
+
+			#compute phonological word information
+			if phonwordmin <> phonwordmax
+				@getSpeechRate (name$,2, phonwordmin, phonwordmax)
+				phonwordphonerate = rate
+				@getSpeechRate (name$,3, phonwordmin, phonwordmax)
+				phonwordsyllrate = rate
+				durphonword = phonwordmax-phonwordmin
+				phonword$ = "n"
+				@getIntervals(name$,1,phonwordmin,phonwordmax)
+				firstmin = Get start point... 1 first
+				if firstmin<phonwordmin
+					first = first+1
+				endif
+				lastmax = Get end point... 1 last
+				if lastmax>phonwordmax
+					last = last-1
+				endif
+				for x from first to last
+					currword$ = Get label of interval... 1 x
+					phonword$ = phonword$ + " " + currword$
+				endfor
+				phonword$ = right$(phonword$,(length(phonword$)-1))
+			else
+				phonwordphonerate = 0
+				phonwordsyllrate = 0
+				durphonword = 0
+				phonword$ = "NA"
+			endif
+
+			#extract ToBI labels associated with the word and sort them as accent or boundary
+			tobiaccent$ = "NA"
+			tobiboundary$ = "NA"
+			@getPoints(name$,4,wordmin,wordmax)
+			if first>0 and last>0
+				for k from first to last
+					tobi$ = Get label of point... 4 k
+					#if the tobi label has any of the following in its string then it is appended to the boundary string; otherwise to the accent string			
+					if index(tobi$,"R")>0 or index(tobi$,"s")>0 or index(tobi$,"%")>0 or index(tobi$,"-")>0
+						tobiboundary$ = tobiboundary$ + ";" + tobi$
+					else
+						tobiaccent$ = tobiaccent$ + ";" + tobi$
+					endif
+				endfor
+			endif
+			#next ifs remove "NA" if anything was added on
+			if length(tobiboundary$)>2
+				tobiboundary$ = right$(tobiboundary$,(length(tobiboundary$)-3))
+			endif
+			if length(tobiaccent$)>2
+				tobiaccent$ = right$(tobiaccent$,(length(tobiaccent$)-3))
+			endif
+
+			#write data to row n of the table
+			select Table Prosody_Project_Acoustic_Data
+			Append row
+			Set numeric value... n token n
+			Set numeric value... n wordmin wordmin
+			Set numeric value... n wordmax wordmax
+			Set numeric value... n stressmin stressmin
+			Set numeric value... n stressmax stressmax
+			Set numeric value... n svmin svmin
+			Set numeric value... n svmax svmax
+			Set numeric value... n phonwordmin phonwordmin
+			Set numeric value... n phonwordmax phonwordmax
+			Set string value... n sv 'sv$'
+			Set string value... n phonword 'phonword$'
+			Set numeric value... n durword durword
+			Set numeric value... n durstress durstress
+			Set numeric value... n dursv dursv
+			Set numeric value... n durphonword durphonword
+			Set numeric value... n wordphonerate wordphonerate
+			Set numeric value... n wordsyllrate wordsyllrate
+			Set numeric value... n stressphonerate stressphonerate
+			Set numeric value... n stresssyllrate stresssyllrate
+			Set numeric value... n phonwordphonerate phonwordphonerate
+			Set numeric value... n phonwordsyllrate phonwordsyllrate
+			Set numeric value... n f0wordmax f0wordmax
+			Set numeric value... n f0wordmin f0wordmin
+			Set numeric value... n f0wordrange f0wordrange
+			Set numeric value... n f0stressmax f0stressmax
+			Set numeric value... n f0stressmin f0stressmin
+			Set numeric value... n f0stressrange f0stressrange
+			Set numeric value... n f0svmax f0svmax
+			Set numeric value... n f0svmin f0svmin
+			Set numeric value... n f0svrange f0svrange
+			Set numeric value... n intsv intsv
+			Set string value... n filename 'name$'
+			Set string value... n word 'word$'
+			Set string value... n tobiaccent 'tobiaccent$'
+			Set string value... n tobiboundary 'tobiboundary$'
+			n = n+1
+
+			#reset phonwordmin; if an unstressed word, they are already equal
+			phonwordmin = phonwordmax
+		#reset begin phonword if the word was a pause
+		else
+			phonwordmin = -1
+		endif
+		#we also don't want "mmm" to be part of phonological words
+		if word$ = "mmm"
+			phonwordmin = -1
+		endif
+	endfor
+	# done running through current file
+
+	# cleans up the object window so the program doesn't crash due to too many objects
+	select TextGrid 'name$'
+	plus Sound 'name$'
+	plus allint
+	plus pitch
+	Remove
+endfor
+# done running through all files in folder
+
+#removes last unnecessary object, leaving only the relevant tables
+select Strings fileList
+Remove
+
+#save table to directory which contains the textgrids and wav files
+select Table Prosody_Project_Acoustic_Data
+Save as comma-separated file... 'dirname$'Prosody_Project_Acoustic_Data.csv
+Remove
+select Table Prosody_Project_Speechrate_Curve
+Save as comma-separated file... 'dirname$'Prosody_Project_Speechrate_Curve.csv
+Remove
+
+#Next section defines procedures
+
+procedure getIntervals (grid$,tier,wleft,wright)
+#grid$ is a string with the name of the textgrid
+#tier is the number of the tier intervals are to be returned fo
+#wleft and wright are the bounds of the window
+#at the end of the procedure, "first" and "last" are the interval numbers of the first and last intervals at least partially covered by the window
+
+	select TextGrid 'grid$'
+	numIntervals = Get number of intervals... tier
+	first = Get interval at time... tier wleft
+	firstmax = Get end point... tier first
+	if firstmax = wleft and first<numIntervals
+		first = first+1
+	endif
+	last = Get interval at time... tier wright
+	if last <> 0
+		lastmin = Get start point... tier last
+		if lastmin=wright
+			last = last-1
+		endif
+	else
+		last = Get number of intervals... tier
+	endif
+endproc
+
+procedure getPoints(name$,tier,wleft,wright)
+#after this procedure, first will be the first point in the point tier to occur after wleft and last will be the last point to occur before or at wright
+#if there were no points in the window, both first and last are set to 0
+
+	select TextGrid 'name$'
+	first = Get high index from time... tier (wleft+0.00000001)
+	last = Get low index from time... tier wright
+	numPoints = Get number of points... tier
+	if first = numPoints
+		firsttime = Get time of point... tier first
+		if first = wleft
+			first = 0
+			last = 0
+		endif
+	endif
+	if first>last or first>numPoints
+		first = 0
+		last = 0
+	endif
+endproc
+
+procedure getSpeechRate (grid$, tier, wleft, wright)
+#grid$ is a string with the name of the textgrid
+#tier is the number of the tier for phones or syllables to compute rate
+#wleft and wright are the bounds of the windows
+#variables within the procedure are named based on Pfitzinger's equation and maintain their values after the procedure ends
+#local phone/syllable rate is returned in variable "rate"
+
+	@getIntervals(grid$,tier,wleft,wright)
+	select TextGrid 'grid$'
+
+	left = first
+	sleft = Get start point... tier left
+	sleftplusone = Get end point... tier left
+
+	lastmax = Get end point... tier last
+	if lastmax=wright
+		right = last+1
+		srightplusone = wright+1
+		sright = wright
+	else
+		right = last
+		sright = Get start point... tier right
+		srightplusone = lastmax
+	endif
+
+	sum = 0
+	for w from (left+1) to (right-1)
+		q = Get end point... tier w
+		v = Get start point... tier w
+		sum = sum+q-v
+	endfor
+
+	rate = (((sleftplusone-wleft)/(sleftplusone-sleft))+((wright-sright)/(srightplusone-sright))+right-left-1)/(sleftplusone-wleft+wright-sright+sum)
+endproc
